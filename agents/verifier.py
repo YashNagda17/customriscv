@@ -30,6 +30,15 @@ logger = logging.getLogger(__name__)
 MAX_VERIFICATION_ATTEMPTS = 5
 
 
+def _read_text_file(path_value: str, fallback: str) -> str:
+    """Read generated artifact text from disk when available."""
+    if path_value:
+        path = Path(path_value)
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    return fallback
+
+
 def _check_structural_completeness(
     code: str, ir_dict: dict
 ) -> list[str]:
@@ -203,12 +212,12 @@ def verify_code(state: AgentState) -> dict:
     Writes: state["verification_result"], state["verification_attempts"],
             state["verification_feedback"]
     """
-    code = state.get("generated_code", "")
-    header = state.get("generated_header", "")
-    ir_dict = state.get("ir_graph", {})
-    weight_metadata = state.get("weights_metadata", {})
     code_path = state.get("code_path", "")
     header_path = state.get("header_path", "")
+    code = _read_text_file(code_path, state.get("generated_code", ""))
+    header = _read_text_file(header_path, state.get("generated_header", ""))
+    ir_dict = state.get("ir_graph", {})
+    weight_metadata = state.get("weights_metadata", {})
     attempt = state.get("verification_attempts", 0) + 1
 
     logger.info(f"Verification attempt {attempt}/{MAX_VERIFICATION_ATTEMPTS}")

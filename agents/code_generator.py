@@ -39,6 +39,22 @@ VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct")
 
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "codegen.txt"
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
+LLM_MAX_TOKENS = 250_000
+
+
+def _read_generated_code_from_output(state: AgentState) -> str:
+    """Read the generated model.c from disk, falling back to state content."""
+    code_path = state.get("code_path", "")
+    if code_path:
+        path = Path(code_path)
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+
+    default_path = OUTPUT_DIR / "model.c"
+    if default_path.exists():
+        return default_path.read_text(encoding="utf-8")
+
+    return state.get("generated_code", "")
 
 
 def _load_system_prompt() -> str:
@@ -49,10 +65,12 @@ def _load_system_prompt() -> str:
 def _build_user_prompt(state: AgentState) -> str:
     """
     Build the user prompt containing IR graph, weight metadata,
-    and any previous feedback or optimization suggestions.
+    detailed implementation guidance, any previous feedback, and
+    optimization suggestions.
 
-    On retries (when verification_feedback is set), includes the
-    previously generated code in a REPAIR MODE section so the LLM
+    On retries (when verification_feedback is set), reads the
+    previously generated code from the output file and includes it
+    in a REPAIR MODE section so the LLM
     can make targeted fixes instead of regenerating from scratch.
     """
     ir_dict = state.get("ir_graph", {})
@@ -98,7 +116,7 @@ def _build_user_prompt(state: AgentState) -> str:
 
     # ── REPAIR MODE: Current Code + Errors ──────────────────────
     if is_retry:
-        current_code = state.get("generated_code", "")
+        current_code = _read_generated_code_from_output(state)
         feedback = state.get("verification_feedback", "")
 
         if current_code:
@@ -141,6 +159,25 @@ def _build_user_prompt(state: AgentState) -> str:
             "Apply the above optimizations to the generated code. "
             "Mark optimized sections with '// OPTIMIZED: <description>'."
         )
+
+    # ── Detailed generation guidance ────────────────────────────
+    sections.append("")
+    sections.append("=" * 60)
+    sections.append("IMPLEMENTATION DETAILING REQUIREMENTS")
+    sections.append("=" * 60)
+    sections.append(
+        "Before emitting code, internally map every IR node to exact "
+        "buffer names, tensor extents, helper calls, loop bounds, and "
+        "weight arrays. The final answer must still contain only the "
+        "single requested model.c code block, but the implementation "
+        "should reflect this detailed plan with clear constants, explicit "
+        "shape comments, and operation-by-operation comments."
+    )
+    sections.append(
+        "Use the full available context to preserve all generated code "
+        "during repairs and optimizations; do not omit helper functions "
+        "or unrelated model_inference steps while fixing localized issues."
+    )
 
     # ── Task Instruction ────────────────────────────────────────
     sections.append("")
@@ -279,6 +316,7 @@ def generate_code(state: AgentState) -> dict:
 
     Reads: state["ir_graph"], state["verification_feedback"],
            state["optimization_suggestions"], state["generated_code"],
+           state["code_path"],
            state["weights_path"], state["weights_manifest"],
            state["weight_precision"], state["weight_mode"]
     Writes: state["generated_code"], state["generated_header"],
@@ -314,7 +352,7 @@ def generate_code(state: AgentState) -> dict:
         api_key=VLLM_API_KEY,
         model=VLLM_MODEL,
         temperature=0.2 if not is_retry else 0.1,  # Lower temp on retries
-        max_tokens=8192,
+        max_tokens=LLM_MAX_TOKENS,
     )
 
     messages = [
