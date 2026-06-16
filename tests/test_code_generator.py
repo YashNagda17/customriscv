@@ -145,6 +145,13 @@ def test_generate_code_writes_model_header_and_implementation(monkeypatch, tmp_p
     assert result["generated_code"] == model_c_path.read_text(encoding="utf-8")
 
 
+def test_generate_code_write_path_has_no_legacy_functions_header_variables():
+    source = Path(code_generator.__file__).read_text(encoding="utf-8")
+
+    assert "functions_h" not in source
+    assert "funcs_path" not in source
+
+
 def test_required_helpers_are_declared_and_implemented_for_ir_ops():
     ir_graph = _linear_ir_graph()
 

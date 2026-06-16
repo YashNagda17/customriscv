@@ -484,6 +484,46 @@ def _generate_fallback_header(state: AgentState) -> str:
     return "\n".join(lines)
 
 
+def _write_generated_artifacts(
+    model_c: str,
+    model_h: str,
+    weights_h: str,
+    loader_c: str = "",
+) -> dict[str, str]:
+    """
+    Write generated code artifacts and return their state path fields.
+
+    Keeping all file writes in one helper avoids legacy loose variables and
+    makes the generation write path easier to test end-to-end.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    code_path = OUTPUT_DIR / "model.c"
+    model_header_path = OUTPUT_DIR / "model.h"
+    header_path = OUTPUT_DIR / "weights.h"
+
+    code_path.write_text(model_c, encoding="utf-8")
+    model_header_path.write_text(model_h, encoding="utf-8")
+    header_path.write_text(weights_h, encoding="utf-8")
+
+    logger.info(f"Generated code written to: {code_path}")
+    logger.info(f"Generated model header written to: {model_header_path}")
+    logger.info(f"Generated header written to: {header_path}")
+
+    paths = {
+        "code_path": str(code_path),
+        "model_header_path": str(model_header_path),
+        "header_path": str(header_path),
+    }
+
+    if loader_c:
+        loader_path = OUTPUT_DIR / "weights_loader.c"
+        loader_path.write_text(loader_c, encoding="utf-8")
+        logger.info(f"Generated loader written to: {loader_path}")
+        paths["loader_path"] = str(loader_path)
+
+    return paths
+
+
 def generate_code(state: AgentState) -> dict:
     """
     LangGraph node function: Generate C code from IR.
@@ -560,35 +600,16 @@ def generate_code(state: AgentState) -> dict:
     model_c = _extract_c_artifact(raw_c_response, "model.c")
 
     # ── Write files ─────────────────────────────────────────────
-    code_path = OUTPUT_DIR / "model.c"
-    model_header_path = OUTPUT_DIR / "model.h"
-    header_path = OUTPUT_DIR / "weights.h"
-    funcs_path = OUTPUT_DIR / "model_functions.h"
-
-    code_path.write_text(model_c, encoding="utf-8")
-    model_header_path.write_text(model_h, encoding="utf-8")
-    header_path.write_text(weights_h, encoding="utf-8")
-    funcs_path.write_text(functions_h, encoding="utf-8")
-    
-    # Save to persistent storage for retries
-    (OUTPUT_DIR / "_latest_model.c").write_text(model_c, encoding="utf-8")
-
-    logger.info(f"Generated code written to: {code_path}")
-    logger.info(f"Generated model header written to: {model_header_path}")
-    logger.info(f"Generated header written to: {header_path}")
-
-    # Write loader if in binary mode
-    if loader_c:
-        loader_path = OUTPUT_DIR / "weights_loader.c"
-        loader_path.write_text(loader_c, encoding="utf-8")
-        logger.info(f"Generated loader written to: {loader_path}")
+    artifact_paths = _write_generated_artifacts(
+        model_c=model_c,
+        model_h=model_h,
+        weights_h=weights_h,
+        loader_c=loader_c,
+    )
 
     return {
         "generated_code": model_c,
         "generated_header": weights_h,
         "generated_model_header": model_h,
-        "code_path": str(code_path),
-        "model_header_path": str(model_header_path),
-        "header_path": str(header_path),
-        "functions_header_path": str(funcs_path),
+        **artifact_paths,
     }
