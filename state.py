@@ -70,8 +70,10 @@ class AgentState(TypedDict, total=False):
     # ── Generated Code (Code Generator → Verifier) ─────────────
     generated_code: str                      # model.c content
     generated_header: str                    # weights.h content
+    generated_model_header: str              # model.h content
     code_path: str                           # Path to saved model.c
     header_path: str                         # Path to saved weights.h
+    model_header_path: str                   # Path to saved model.h
 
     # ── Verification ────────────────────────────────────────────
     verification_result: VerificationResult
