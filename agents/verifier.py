@@ -17,6 +17,10 @@ import os
 import re
 from pathlib import Path
 
+from agents.codegen_contract import (
+    helper_name_from_signature,
+    required_helper_signatures,
+)
 from ir import IRGraph, IROpType
 from state import AgentState
 from tools.compile import (
@@ -30,8 +34,17 @@ logger = logging.getLogger(__name__)
 MAX_VERIFICATION_ATTEMPTS = 5
 
 
+def _read_text_file(path_value: str, fallback: str) -> str:
+    """Read generated artifact text from disk when available."""
+    if path_value:
+        path = Path(path_value)
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    return fallback
+
+
 def _check_structural_completeness(
-    code: str, ir_dict: dict
+    code: str, ir_dict: dict, model_header: str = ""
 ) -> list[str]:
     """
     Check that the generated C code covers all IR operations.
@@ -49,17 +62,10 @@ def _check_structural_completeness(
         )
 
     # Check that weights.h is included
-    if '#include "weights.h"' not in code:
+    if '#include "weights.h"' not in code and '#include "model.h"' not in code:
         issues.append(
-            'ERROR: Missing #include "weights.h". '
-            "Weight arrays must be imported from the header."
-        )
-        
-    # Check that model_functions.h is included
-    if '#include "model_functions.h"' not in code:
-        issues.append(
-            'ERROR: Missing #include "model_functions.h". '
-            "Function prototypes must be imported from the header."
+            'ERROR: Missing #include "model.h" or #include "weights.h". '
+            "Weight arrays must be imported through the generated headers."
         )
 
     # Check for each weight tensor referenced in the IR
@@ -99,6 +105,54 @@ def _check_structural_completeness(
                 f"none of the expected patterns {patterns} found in code."
             )
 
+    return issues
+
+
+def _check_model_header(model_header: str, ir_dict: dict | None = None) -> list[str]:
+    """Validate the LLM-generated model.h contract."""
+    issues: list[str] = []
+    if not model_header.strip():
+        issues.append("ERROR: model.h is empty.")
+        return issues
+
+    if "#pragma once" not in model_header and "#ifndef" not in model_header:
+        issues.append("WARNING: model.h has no include guard.")
+    if '#include "weights.h"' not in model_header:
+        issues.append('ERROR: model.h must include "weights.h".')
+    if "model_inference" not in model_header:
+        issues.append(
+            "ERROR: model.h must declare model_inference(const float* input, float* output)."
+        )
+    if re.search(r'\bstatic\s+float\s+\w+\s*\[', model_header):
+        issues.append(
+            "ERROR: model.h must not define activation storage arrays; define storage in model.c."
+        )
+    if ir_dict is not None:
+        for signature in required_helper_signatures(ir_dict):
+            helper_name = helper_name_from_signature(signature)
+            if not re.search(rf"\b{re.escape(helper_name)}\s*\(", model_header):
+                issues.append(
+                    f"ERROR: model.h is missing required helper prototype "
+                    f"for IR operation helper '{helper_name}': {signature}"
+                )
+    return issues
+
+
+def _check_required_helper_definitions(code: str, ir_dict: dict) -> list[str]:
+    """Validate that model.c implements every IR-required helper function."""
+    issues: list[str] = []
+    for signature in required_helper_signatures(ir_dict):
+        helper_name = helper_name_from_signature(signature)
+        if not re.search(
+            rf"(^|\n)\s*(?:static\s+)?(?:inline\s+)?\w[\w\s\*]*\b"
+            rf"{re.escape(helper_name)}\s*\([^;]*\)\s*\{{",
+            code,
+            re.DOTALL,
+        ):
+            issues.append(
+                f"ERROR: model.c is missing required helper implementation "
+                f"for '{helper_name}' declared by the IR contract."
+            )
     return issues
 
 
@@ -210,12 +264,16 @@ def verify_code(state: AgentState) -> dict:
     Writes: state["verification_result"], state["verification_attempts"],
             state["verification_feedback"]
     """
-    code = state.get("generated_code", "")
-    header = state.get("generated_header", "")
-    ir_dict = state.get("ir_graph", {})
-    weight_metadata = state.get("weights_metadata", {})
     code_path = state.get("code_path", "")
     header_path = state.get("header_path", "")
+    model_header_path = state.get("model_header_path", "")
+    code = _read_text_file(code_path, state.get("generated_code", ""))
+    header = _read_text_file(header_path, state.get("generated_header", ""))
+    model_header = _read_text_file(
+        model_header_path, state.get("generated_model_header", "")
+    )
+    ir_dict = state.get("ir_graph", {})
+    weight_metadata = state.get("weights_metadata", {})
     attempt = state.get("verification_attempts", 0) + 1
 
     logger.info(f"Verification attempt {attempt}/{MAX_VERIFICATION_ATTEMPTS}")
@@ -225,7 +283,7 @@ def verify_code(state: AgentState) -> dict:
     compiler_output = ""
 
     # ── 1. Structural completeness ──────────────────────────────
-    structural = _check_structural_completeness(code, ir_dict)
+    structural = _check_structural_completeness(code, ir_dict, model_header)
     for issue in structural:
         if issue.startswith("ERROR"):
             all_errors.append(issue)
@@ -240,7 +298,21 @@ def verify_code(state: AgentState) -> dict:
         else:
             all_warnings.append(issue)
 
+    helper_definition_issues = _check_required_helper_definitions(code, ir_dict)
+    for issue in helper_definition_issues:
+        if issue.startswith("ERROR"):
+            all_errors.append(issue)
+        else:
+            all_warnings.append(issue)
+
     # ── 3. Header validation ────────────────────────────────────
+    model_header_issues = _check_model_header(model_header, ir_dict)
+    for issue in model_header_issues:
+        if issue.startswith("ERROR"):
+            all_errors.append(issue)
+        else:
+            all_warnings.append(issue)
+
     header_issues = _check_header(header, weight_metadata)
     for issue in header_issues:
         if issue.startswith("ERROR"):
