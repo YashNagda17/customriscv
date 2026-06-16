@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_API_KEY = os.environ.get("VLLM_API_KEY", "dummy")  # vLLM doesn't need real key
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct")
+VLLM_MAX_TOKENS = int(os.environ.get("VLLM_MAX_TOKENS", "200000"))
 
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "codegen.txt"
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
@@ -96,9 +97,23 @@ def _build_user_prompt(state: AgentState) -> str:
                 f"// shape={shape}, originally: {name}"
             )
 
+    # ── FUNCTION HEADER ─────────────────────────────────────────
+    functions_h = state.get("generated_functions_header", "")
+    if functions_h:
+        sections.append("")
+        sections.append("=" * 60)
+        sections.append("FUNCTION PROTOTYPES (from model_functions.h)")
+        sections.append("=" * 60)
+        sections.append(functions_h)
+
     # ── REPAIR MODE: Current Code + Errors ──────────────────────
     if is_retry:
-        current_code = state.get("generated_code", "")
+        latest_c_path = OUTPUT_DIR / "_latest_model.c"
+        if latest_c_path.exists():
+            current_code = latest_c_path.read_text(encoding="utf-8")
+        else:
+            current_code = state.get("generated_code", "")
+            
         feedback = state.get("verification_feedback", "")
 
         if current_code:
@@ -157,12 +172,35 @@ def _build_user_prompt(state: AgentState) -> str:
         sections.append(
             "Generate the complete model.c file for this neural network "
             "model targeting RISC-V rv32imac. "
+            "It MUST #include \"model_functions.h\" and implement all functions declared there. "
             "Do NOT generate weights.h — it is auto-generated. "
             "Just #include \"weights.h\" and use the weight array names "
             "listed above. "
             "Output exactly ONE ```c model.c code block."
         )
 
+    return "\n".join(sections)
+
+def _build_header_prompt(state: AgentState) -> str:
+    """Prompt for generating the model_functions.h header."""
+    ir_dict = state.get("ir_graph", {})
+    ir_graph = IRGraph.from_dict(ir_dict)
+    
+    sections = []
+    sections.append("=" * 60)
+    sections.append("IR GRAPH")
+    sections.append("=" * 60)
+    sections.append(ir_graph.pretty_print())
+    sections.append("")
+    sections.append("=" * 60)
+    sections.append("TASK")
+    sections.append("=" * 60)
+    sections.append(
+        "Generate a C header file named `model_functions.h` containing ONLY the function "
+        "prototypes (declarations) needed to implement this neural network on bare-metal RISC-V. "
+        "Include `void model_inference(const float* input, float* output);` "
+        "Do NOT implement the functions. Output exactly ONE ```c model_functions.h code block."
+    )
     return "\n".join(sections)
 
 
@@ -193,6 +231,16 @@ def _extract_model_c(response: str) -> str:
 
     # Strategy 3: Use entire response
     logger.warning("Could not extract code blocks — using raw response")
+    return response.strip()
+
+def _extract_header_c(response: str) -> str:
+    blocks = re.findall(
+        r'```(?:c|C)?\s*(?:model_functions\.h)?\s*\n(.*?)```',
+        response,
+        re.DOTALL,
+    )
+    if blocks:
+        return max(blocks, key=len).strip()
     return response.strip()
 
 
@@ -314,15 +362,41 @@ def generate_code(state: AgentState) -> dict:
         api_key=VLLM_API_KEY,
         model=VLLM_MODEL,
         temperature=0.2 if not is_retry else 0.1,  # Lower temp on retries
-        max_tokens=8192,
+        max_tokens=VLLM_MAX_TOKENS,
     )
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # ── LLM Call 1: Generate Header (if needed) ─────────────────
+    functions_h = state.get("generated_functions_header", "")
+    latest_h_path = OUTPUT_DIR / "_latest_functions.h"
+    if not functions_h and latest_h_path.exists():
+        functions_h = latest_h_path.read_text(encoding="utf-8")
+        state["generated_functions_header"] = functions_h
+        
+    if not is_retry or not functions_h:
+        logger.info("Calling LLM to generate model_functions.h ...")
+        h_prompt = _build_header_prompt(state)
+        h_messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=h_prompt),
+        ]
+        response_h = llm.invoke(h_messages)
+        functions_h = _extract_header_c(response_h.content)
+        state["generated_functions_header"] = functions_h
+        
+        latest_h_path.write_text(functions_h, encoding="utf-8")
+        (OUTPUT_DIR / "model_functions.h").write_text(functions_h, encoding="utf-8")
+        logger.info(f"Generated functions header length: {len(functions_h)} chars")
+
+    # ── LLM Call 2: Generate Implementation ─────────────────────
+    user_prompt = _build_user_prompt(state)
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
     ]
 
-    logger.info(f"Calling LLM ({VLLM_MODEL}) ...")
+    logger.info(f"Calling LLM ({VLLM_MODEL}) for model.c ...")
     if is_retry:
         logger.info("  → REPAIR MODE: feeding back current code + errors")
     response = llm.invoke(messages)
@@ -333,12 +407,16 @@ def generate_code(state: AgentState) -> dict:
     model_c = _extract_model_c(raw_response)
 
     # ── Write files ─────────────────────────────────────────────
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     code_path = OUTPUT_DIR / "model.c"
     header_path = OUTPUT_DIR / "weights.h"
+    funcs_path = OUTPUT_DIR / "model_functions.h"
 
     code_path.write_text(model_c, encoding="utf-8")
     header_path.write_text(weights_h, encoding="utf-8")
+    funcs_path.write_text(functions_h, encoding="utf-8")
+    
+    # Save to persistent storage for retries
+    (OUTPUT_DIR / "_latest_model.c").write_text(model_c, encoding="utf-8")
 
     logger.info(f"Generated code written to: {code_path}")
     logger.info(f"Generated header written to: {header_path}")
@@ -352,6 +430,8 @@ def generate_code(state: AgentState) -> dict:
     return {
         "generated_code": model_c,
         "generated_header": weights_h,
+        "generated_functions_header": functions_h,
         "code_path": str(code_path),
         "header_path": str(header_path),
+        "functions_header_path": str(funcs_path),
     }

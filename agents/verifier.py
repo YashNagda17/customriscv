@@ -54,6 +54,13 @@ def _check_structural_completeness(
             'ERROR: Missing #include "weights.h". '
             "Weight arrays must be imported from the header."
         )
+        
+    # Check that model_functions.h is included
+    if '#include "model_functions.h"' not in code:
+        issues.append(
+            'ERROR: Missing #include "model_functions.h". '
+            "Function prototypes must be imported from the header."
+        )
 
     # Check for each weight tensor referenced in the IR
     for node in ir_graph.nodes:
