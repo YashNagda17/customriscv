@@ -28,7 +28,7 @@ VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct")
 
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "optimizer.txt"
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
-LLM_MAX_TOKENS = 250_000
+LLM_MAX_TOKENS = 200_000
 
 MAX_OPTIMIZATION_ITERATIONS = 3
 
