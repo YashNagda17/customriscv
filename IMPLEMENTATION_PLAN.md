@@ -2,7 +2,7 @@
 
 A LangGraph-based multi-agent system that converts PyTorch models into optimized RISC-V C code, simulates on Hazard3, and synthesizes with OpenROAD — forming a **closed-loop hardware-aware compiler**.
 
-This unified plan integrates the original design with the enhancements made to resolve weight serialization, deterministic header loading, and iterative feedback loops.
+This unified plan integrates the original design with the enhancements made to resolve weight serialization, deterministic header loading, iterative feedback loops, two-phase LLM generation, and robust state persistence.
 
 ---
 
@@ -111,11 +111,11 @@ class IRGraph:
 
 ---
 
-## Proposed Changes
+## Project Structure & Component Specifications
 
-### Unified Project Structure
+### Project Structure
 
-```
+```text
 agentic-riscv/
 ├── main.py                    # Entry point with CLI args for precision & weight-mode
 ├── graph.py                   # LangGraph workflow definition
@@ -124,7 +124,8 @@ agentic-riscv/
 ├── agents/
 │   ├── __init__.py
 │   ├── fx_parser.py           # FX → Custom IR + npz serialization
-│   ├── code_generator.py      # IR → C code (model.c) with deterministic weights header, repair loops
+│   ├── codegen_contract.py    # [NEW] Standardizes required helper signatures dynamically
+│   ├── code_generator.py      # IR → C code (model.h / model.c) with deterministic weights header, repair loops
 │   ├── verifier.py            # Syntax & structural validation (detects placeholders/errors)
 │   ├── human_review.py        # Human-in-the-loop pause
 │   ├── simulator.py           # Hazard3 simulation wrapper
@@ -132,22 +133,21 @@ agentic-riscv/
 │   ├── optimizer.py           # Optimization suggestions (LLM)
 │   └── report.py              # Final report generator
 ├── prompts/
-│   ├── codegen.txt            # Code generator system prompt (now repair-focused & excludes weights.h generation)
+│   ├── codegen.txt            # Code generator system prompt
 │   └── optimizer.txt          # Optimization system prompt
 ├── tools/
 │   ├── __init__.py
 │   ├── compile.py             # RISC-V GCC cross-compilation
-│   ├── export_weights.py      # [NEW] NPZ → Bin & Manifest + C header/loader generator
+│   ├── export_weights.py      # NPZ → Bin & Manifest + C header/loader generator
 │   ├── hazard3.py             # Hazard3 simulator wrapper
 │   └── openroad.py            # OpenROAD flow wrapper
 ├── examples/
 │   └── demo_model.py          # Simple PyTorch model for testing
+├── tests/                     # [NEW] Unit tests for LLM generation components
 ├── output/                    # Generated artifacts (gitignored)
 ├── requirements.txt
 └── README.md
 ```
-
----
 
 ### Component Specifications
 
@@ -160,22 +160,18 @@ Defines the LangGraph shared `TypedDict` state:
   - `weights_manifest`: Manifest dictionary mapping parameter names to details (`c_name`, `offset`, `size_bytes`, `numel`, `shape`, `c_type`, `precision`)
   - `weight_precision`: Supported precision mode (`f32`, `f16`, `bf16`, `mxfp8`)
   - `weight_mode`: Storage strategy (`embedded` or `binary`)
-- `generated_code` (model.c content), `generated_header` (weights.h content)
-- `verification_result` (pass/fail + errors), `verification_attempts` (counter, max 5)
+- **Generation Output**: `generated_code` (model.c content), `generated_header` (weights.h content), `generated_model_header` (model.h content)
+- `verification_result`, `verification_attempts`, `verification_exhausted` (boolean for routing)
 - `human_approved` (bool)
-- `simulation_result` (cycles, trace, comparisons)
-- `synthesis_result` (power, area, frequency)
-- `optimization_suggestions`, `optimization_iteration`
+- `simulation_result`, `synthesis_result`, `optimization_suggestions`, `optimization_iteration`
 - `final_report`, `error`
 
 #### [tools/export_weights.py](file:///c:/Coding%20projects/agentic-riscv/tools/export_weights.py)
 A pure-Python utility to process model weights:
-- Exports weights from `weights.npz` to a flat binary `weights.bin` supporting customizable precision (`f32`, `f16`, `bf16`, `mxfp8`).
+- Exports weights from `weights.npz` to a flat binary `weights.bin` supporting customizable precision.
 - Generates `weights_manifest.json` mapping parameter details.
-- Generates `weights.h` deterministically depending on selected mode:
-  - **Embedded**: Emits `static const type name[N] = {val1, val2, ...};` arrays.
-  - **Binary**: Emits `extern type name[N];` arrays + `load_weights()` loading signature.
-- Generates `weights_loader.c` for binary loading mode using `fopen`/`fread`.
+- Generates `weights.h` deterministically depending on selected mode.
+- Sanitizes float values (e.g. `inf` → `FLT_MAX`, `nan` → `0.0f`) before emitting C literals to prevent compilation errors.
 
 #### [agents/fx_parser.py](file:///c:/Coding%20projects/agentic-riscv/agents/fx_parser.py)
 Python analysis agent:
@@ -183,46 +179,52 @@ Python analysis agent:
 - Maps FX ops to Custom `IRNode` entities.
 - Extracts shape information from tensor metadata.
 - Saves model weights to `output/weights.npz`.
-- Invokes `export_weights` to generate `weights.bin`, `weights.h` (and `weights_loader.c` if configured in binary mode) and populates weight manifest fields in the shared state.
+- Invokes `export_weights` to generate `weights.bin`, `weights.h` and populates weight manifest fields.
 
 #### [agents/code_generator.py](file:///c:/Coding%20projects/agentic-riscv/agents/code_generator.py)
-LLM-powered code generation agent:
-- **No LLM weight header generation**: Outsources `weights.h` creation to deterministic code, forcing the LLM to only write the computational logic in `model.c`.
-- **Iterative Repair Mode**:
-  - For attempt = 1: Prompts LLM to generate `model.c` from scratch based on the IR graph and weight declarations.
-  - For attempt >= 2: Sends a Repair Prompt detailing the current generated code, the exact compiler/verification errors, and instructions to target and correct errors.
-- Extract computational C code blocks for `model.c` and writes them to the `output/` directory.
+LLM-powered code generation agent using **Two-Phase Generation**:
+- **Phase 1 (Contract Definition):** Generates `model.h` containing includes (`#include "weights.h"`), tensor contracts, and function prototypes required by `codegen_contract.py`.
+- **Phase 2 (Implementation):** Generates `model.c` that implements the logic.
+- **File-Backed Persistence:** Saves outputs directly to `output/_latest_model.c` to prevent state loss during retries.
+- **Iterative Repair Mode:** Reads from `output/_latest_model.c` and targets specific compiler errors reported by the verifier.
 
 #### [agents/verifier.py](file:///c:/Coding%20projects/agentic-riscv/agents/verifier.py)
 Verification agent:
-- Syntactic check: Compiles with cross-compiler `riscv32-unknown-elf-gcc -fsyntax-only` (falls back to host `gcc` if cross-compiler missing).
-- Compilation check: Builds a complete object file including both `model.c` and weight headers/loaders.
-- Static validation: Parses output for missing components, shape size mismatches, and placeholder implementations (such as `{0}` array values or unpopulated loop skeletons).
+- Compiles with cross-compiler `riscv32-unknown-elf-gcc -fsyntax-only`.
+- Checks that `model.c` includes `model.h` and adheres to `codegen_contract.py` compliance.
+- Parses output for missing components, shape mismatches, and placeholder implementations.
 
-#### [prompts/codegen.txt](file:///c:/Coding%20projects/agentic-riscv/prompts/codegen.txt)
-LLM System Prompt:
-- Informs the LLM that it is an expert embedded C programmer targeting RISC-V bare-metal architectures.
-- Specifies that weight arrays are provided in `#include "weights.h"` and details their names/dimensions.
-- Outlines the **Repair Mode** instructions: "If CURRENT CODE is provided, focus on correcting the compiler errors listed rather than rebuilding."
+#### [graph.py](file:///c:/Coding%20projects/agentic-riscv/graph.py)
+LangGraph workflow definition:
+- Routes between parsing, generation, verification, simulation, and synthesis.
+- After 5 verification failures, routes to `human_review` instead of aborting.
 
-#### [agents/simulator.py](file:///c:/Coding%20projects/agentic-riscv/agents/simulator.py)
-Simulator wrapper:
-- Cross-compiles source files into a target RISC-V ELF binary.
-- Simulates on Hazard3 simulator, extracting cycle count metrics.
-- Validates computation outputs against reference values from PyTorch.
+#### [main.py](file:///c:/Coding%20projects/agentic-riscv/main.py)
+Entry point:
+- Supports `--start-from` argument (e.g., `verify`, `simulate`) to bypass code generation and load existing state directly from `output/` artifacts.
+- Extracts `weights_metadata` and IR metrics (`total_params`, `model_memory_bytes`) robustly to prevent empty reports when skipping `parse_fx`.
 
-#### [agents/synthesis.py](file:///c:/Coding%20projects/agentic-riscv/agents/synthesis.py)
-Synthesis wrapper:
-- Integrates OpenROAD flow inputs (Yosys RTL synthesis, OpenROAD PnR).
-- Parses reports to capture power, area, and max frequency characteristics.
+---
 
-#### [agents/optimizer.py](file:///c:/Coding%20projects/agentic-riscv/agents/optimizer.py)
-LLM optimization agent:
-- Examines hardware telemetry metrics (cycles, area, power).
-- Proposes optimizations (e.g. GEMM tiling, loop unrolling, fusion) passed into the generator.
+## Recent Pipeline Enhancements (Issues 1-6)
 
-#### [agents/report.py](file:///c:/Coding%20projects/agentic-riscv/agents/report.py)
-Aggregates all steps and measurements into a Markdown report summary.
+### Issue 1: `generated_code` Is Empty on Retries
+- **Fix:** File-backed code persistence. Instead of relying on LangGraph state alone, persist the generated code to a temp file (`output/_latest_model.c`) and read it back on retries.
+
+### Issue 2: Two-Phase LLM Code Generation & Codegen Contracts
+- **Fix:** Two-phase generation. LLM Call 1 generates `model.h` (includes, tensor contracts, function prototypes provided via `codegen_contract.py`). LLM Call 2 receives the exact text of `model.h` and generates `model.c`.
+
+### Issue 3: Increase `max_tokens` to 200K for MI300x GPU
+- **Fix:** Made `max_tokens` configurable in `code_generator.py`, reading from `VLLM_MAX_TOKENS` environment variable (default 200,000).
+
+### Issue 4: Fix `inff` Undeclared Error in `weights.h`
+- **Fix:** Sanitized float values in `export_weights.py` before emitting C literals (`inf` → `3.402823466e+38f`, `-inf` → `-3.402823466e+38f`, `nan` → `0.0f`).
+
+### Issue 5: Route to Human Review After 5 Verification Failures
+- **Fix:** After 5 compilation failures, LangGraph routes to `human_review` instead of `report`. Users can edit files manually and choose to (e)dit and re-verify, (r)etry generation, (a)pprove and proceed, or (q)uit.
+
+### Issue 6: Allow Starting the Pipeline from a Specific Agent
+- **Fix:** Implemented a `--start-from` CLI argument in `main.py` that populates `AgentState` by loading previously generated files from the `output/` directory, computing metadata directly from the `ir_graph.json` or fallback PyTorch model.
 
 ---
 
@@ -247,15 +249,18 @@ Aggregates all steps and measurements into a Markdown report summary.
    print('IR nodes parsed:', len(result['ir_graph']['nodes']))
    "
    ```
-3. **End-to-End Compile Loop & Verification Loop Check**:
-   - Execute the compilation pipeline:
-     ```bash
-     python main.py --model examples/demo_model.py --mock-tools
-     ```
-   - Check that `output/weights.npz` and `output/weights.bin` are correctly produced.
-   - Inspect `output/weights.h` to confirm it contains actual parameter values rather than mock placeholders.
-   - Check that retry logic correctly feeds current code and error streams back to the LLM on compilation failures.
+3. **End-to-End Pipeline Check**:
+   - Run pipeline end-to-end with `--demo`.
+   - Verify `output/_latest_model.c` is created and persists across retries.
+   - Verify `output/model.h` is generated and included in `model.c`.
+   - Verify no `inff` or `nanf` in `output/weights.h`.
+4. **Retry and Route Testing**:
+   - Simulate a verification failure and confirm repair mode reads code from `_latest_model.c`.
+   - Ensure after 5 failures, pipeline routes to human review.
+5. **State Recovery Check**:
+   - Test `--start-from verify` after manually editing `output/model.c` to ensure state is correctly restored.
 
 ### Manual Verification
-- Manually check the retry/repair prompts in logs to verify context size constraints and error inclusion layout.
-- Review generated `model.c` structures to ensure proper `#include "weights.h"` matching.
+- Check LLM prompts in logs to confirm `model.h` content and `codegen_contract` signatures are included in the second LLM call.
+- Verify that `--start-from verify` correctly populates reporting metrics (no empty dictionaries/tables).
+- Verify that the human review interrupt shows the correct options after verification exhaustion.
