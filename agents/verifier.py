@@ -17,6 +17,10 @@ import os
 import re
 from pathlib import Path
 
+from agents.codegen_contract import (
+    helper_name_from_signature,
+    required_helper_signatures,
+)
 from ir import IRGraph, IROpType
 from state import AgentState
 from tools.compile import (
@@ -104,7 +108,7 @@ def _check_structural_completeness(
     return issues
 
 
-def _check_model_header(model_header: str) -> list[str]:
+def _check_model_header(model_header: str, ir_dict: dict | None = None) -> list[str]:
     """Validate the LLM-generated model.h contract."""
     issues: list[str] = []
     if not model_header.strip():
@@ -123,6 +127,32 @@ def _check_model_header(model_header: str) -> list[str]:
         issues.append(
             "ERROR: model.h must not define activation storage arrays; define storage in model.c."
         )
+    if ir_dict is not None:
+        for signature in required_helper_signatures(ir_dict):
+            helper_name = helper_name_from_signature(signature)
+            if not re.search(rf"\b{re.escape(helper_name)}\s*\(", model_header):
+                issues.append(
+                    f"ERROR: model.h is missing required helper prototype "
+                    f"for IR operation helper '{helper_name}': {signature}"
+                )
+    return issues
+
+
+def _check_required_helper_definitions(code: str, ir_dict: dict) -> list[str]:
+    """Validate that model.c implements every IR-required helper function."""
+    issues: list[str] = []
+    for signature in required_helper_signatures(ir_dict):
+        helper_name = helper_name_from_signature(signature)
+        if not re.search(
+            rf"(^|\n)\s*(?:static\s+)?(?:inline\s+)?\w[\w\s\*]*\b"
+            rf"{re.escape(helper_name)}\s*\([^;]*\)\s*\{{",
+            code,
+            re.DOTALL,
+        ):
+            issues.append(
+                f"ERROR: model.c is missing required helper implementation "
+                f"for '{helper_name}' declared by the IR contract."
+            )
     return issues
 
 
@@ -268,8 +298,15 @@ def verify_code(state: AgentState) -> dict:
         else:
             all_warnings.append(issue)
 
+    helper_definition_issues = _check_required_helper_definitions(code, ir_dict)
+    for issue in helper_definition_issues:
+        if issue.startswith("ERROR"):
+            all_errors.append(issue)
+        else:
+            all_warnings.append(issue)
+
     # ── 3. Header validation ────────────────────────────────────
-    model_header_issues = _check_model_header(model_header)
+    model_header_issues = _check_model_header(model_header, ir_dict)
     for issue in model_header_issues:
         if issue.startswith("ERROR"):
             all_errors.append(issue)

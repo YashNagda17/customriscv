@@ -24,6 +24,7 @@ from typing import Literal
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
+from agents.codegen_contract import required_helper_signatures
 from ir import IRGraph
 from state import AgentState
 from tools.export_weights import (
@@ -283,6 +284,7 @@ def _build_model_header_prompt(state: AgentState) -> str:
     dependencies, tensor block declarations, and function stubs only.
     """
     ir_graph = IRGraph.from_dict(state.get("ir_graph", {}))
+    required_helpers = required_helper_signatures(state.get("ir_graph", {}))
     is_retry = bool(state.get("verification_feedback", ""))
     sections = [
         "=" * 60,
@@ -300,6 +302,11 @@ def _build_model_header_prompt(state: AgentState) -> str:
         "static-size tensor block macros/constants, and provide prototypes for "
         "all helper functions and model_inference(). Do not implement function "
         "bodies and do not define storage in model.h.",
+        "",
+        "REQUIRED HELPER PROTOTYPES:",
+        *(f"  {signature}" for signature in required_helpers),
+        "If the implementation needs any additional non-static helper function, "
+        "declare its prototype in model.h as well.",
         "Output exactly ONE ```c model.h code block.",
     ]
 
@@ -329,6 +336,7 @@ def _build_model_header_prompt(state: AgentState) -> str:
 def _build_model_c_prompt(state: AgentState, model_h: str) -> str:
     """Build step-3 prompt: implement model.c against the generated model.h."""
     base = _build_user_prompt(state)
+    required_helpers = required_helper_signatures(state.get("ir_graph", {}))
     sections = [
         base,
         "",
@@ -343,6 +351,9 @@ def _build_model_c_prompt(state: AgentState, model_h: str) -> str:
         "Implement every prototype and tensor block declared in model.h. "
         "Include \"model.h\" (which includes weights.h) and keep model.c "
         "consistent with the inputs, outputs, dependencies, and stubs above. "
+        "The following IR-required helpers must have matching non-static "
+        "definitions in model.c:",
+        *(f"  {signature}" for signature in required_helpers),
         "Output exactly ONE ```c model.c code block.",
     ]
     return "\n".join(sections)
