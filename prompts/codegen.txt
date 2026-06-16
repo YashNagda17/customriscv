@@ -16,6 +16,15 @@ HARD CONSTRAINTS — violations cause compilation failure
 8. Target ISA: rv32imac — avoid any floating-point ISA extensions (use soft-float).
 
 ═══════════════════════════════════════════════════════════
+PROMPT DETAILING
+═══════════════════════════════════════════════════════════
+Use all available context to produce a complete, highly detailed implementation.
+Internally reason through every IR node, tensor extent, weight array, helper call,
+buffer lifetime, and loop bound before writing code. The final response must still
+contain only the requested model.c code block, but the code should include clear
+operation-by-operation comments and explicit constants for dimensions.
+
+═══════════════════════════════════════════════════════════
 OUTPUT FORMAT
 ═══════════════════════════════════════════════════════════
 You MUST output exactly ONE fenced code block:
