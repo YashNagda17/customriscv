@@ -80,6 +80,50 @@ def _read_generated_model_header_from_output(state: AgentState) -> str:
     )
 
 
+def _build_repair_context_sections(state: AgentState, target_artifact: str) -> list[str]:
+    """Build repair-mode context with original generated artifacts and errors."""
+    feedback = state.get("verification_feedback", "")
+    current_header = _read_generated_model_header_from_output(state)
+    current_code = _read_generated_code_from_output(state)
+
+    sections: list[str] = [
+        "",
+        "=" * 60,
+        f"⚠️  REPAIR MODE CONTEXT FOR {target_artifact}",
+        "=" * 60,
+        "Use the original generated artifacts below as the starting point. "
+        "Make targeted fixes only; do not drop unrelated declarations, helper "
+        "functions, buffers, or model_inference steps.",
+    ]
+
+    if current_header:
+        sections.extend([
+            "",
+            "=" * 60,
+            "ORIGINAL model.h FROM PREVIOUS GENERATION",
+            "=" * 60,
+            current_header,
+        ])
+
+    if current_code:
+        sections.extend([
+            "",
+            "=" * 60,
+            "ORIGINAL model.c FROM PREVIOUS GENERATION",
+            "=" * 60,
+            current_code,
+        ])
+
+    sections.extend([
+        "",
+        "=" * 60,
+        "VERIFICATION ERRORS — FIX THESE",
+        "=" * 60,
+        feedback or "(No verifier feedback was provided.)",
+    ])
+    return sections
+
+
 def _load_system_prompt() -> str:
     """Load the code generation system prompt."""
     return PROMPT_PATH.read_text(encoding="utf-8")
@@ -159,31 +203,15 @@ def _build_user_prompt(state: AgentState) -> str:
                 f"// shape={shape}, originally: {name}"
             )
 
-    # ── REPAIR MODE: Current Code + Errors ──────────────────────
+    # ── REPAIR MODE: Original Artifacts + Errors ────────────────
     if is_retry:
-        current_code = _read_generated_code_from_output(state)
-        feedback = state.get("verification_feedback", "")
-
-        if current_code:
-            sections.append("")
-            sections.append("=" * 60)
-            sections.append(
-                "⚠️  CURRENT CODE (contains errors — you are in REPAIR MODE)"
-            )
-            sections.append("=" * 60)
-            sections.append(current_code)
-
-        sections.append("")
-        sections.append("=" * 60)
-        sections.append("⚠️  VERIFICATION ERRORS — FIX THESE")
-        sections.append("=" * 60)
-        sections.append(feedback)
+        sections.extend(_build_repair_context_sections(state, "model.c"))
         sections.append("")
         sections.append(
             "You are in REPAIR MODE. Fix ALL the errors listed above "
-            "in the current code. Output the COMPLETE fixed model.c file. "
-            "Keep the overall structure intact. Mark fixes with "
-            "// FIX: <description> comments."
+            "using the original model.h and model.c as context. Output the "
+            "COMPLETE fixed model.c file. Keep the overall structure intact. "
+            "Mark fixes with // FIX: <description> comments."
         )
     else:
         # ── First attempt: generate from scratch ────────────────
@@ -313,24 +341,11 @@ def _build_model_header_prompt(state: AgentState) -> str:
     ]
 
     if is_retry:
-        current_header = _read_generated_model_header_from_output(state)
-        feedback = state.get("verification_feedback", "")
-        if current_header:
-            sections.extend([
-                "",
-                "=" * 60,
-                "CURRENT model.h (contains errors — REPAIR MODE)",
-                "=" * 60,
-                current_header,
-            ])
-        sections.extend([
-            "",
-            "=" * 60,
-            "VERIFICATION ERRORS — FIX HEADER-RELEVANT ISSUES",
-            "=" * 60,
-            feedback,
-            "Make targeted fixes and output the COMPLETE fixed model.h.",
-        ])
+        sections.extend(_build_repair_context_sections(state, "model.h"))
+        sections.append(
+            "Make targeted header fixes and output the COMPLETE fixed model.h. "
+            "Preserve any declarations that are still needed by the original model.c."
+        )
 
     return "\n".join(sections)
 
