@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import agents.code_generator as code_generator
-from agents.codegen_contract import required_helper_signatures
+from ir import required_helper_signatures
 from agents.verifier import _check_model_header, _check_required_helper_definitions
 
 
@@ -187,6 +187,35 @@ def test_generate_code_recovers_unfenced_step3_model_c(monkeypatch, tmp_path):
     assert result["generated_code"].startswith('#include "model.h"')
     assert "Here is the implementation" not in result["generated_code"]
     assert "void model_inference" in result["generated_code"]
+
+
+def test_repair_prompts_include_original_artifacts_and_errors(tmp_path):
+    model_h_path = tmp_path / "model.h"
+    model_c_path = tmp_path / "model.c"
+    model_h_path.write_text(
+        '#pragma once\n#include "weights.h"\n// ORIGINAL_HEADER_SENTINEL\n',
+        encoding="utf-8",
+    )
+    model_c_path.write_text(
+        '#include "model.h"\n// ORIGINAL_CODE_SENTINEL\n'
+        'void model_inference(const float* input, float* output) { output[0] = input[0]; }\n',
+        encoding="utf-8",
+    )
+    state = {
+        **_minimal_state(),
+        "verification_feedback": "VERIFIER_ERROR_SENTINEL",
+        "model_header_path": str(model_h_path),
+        "code_path": str(model_c_path),
+    }
+
+    header_prompt = code_generator._build_model_header_prompt(state)
+    c_prompt = code_generator._build_model_c_prompt(state, "#pragma once\n")
+
+    for prompt in (header_prompt, c_prompt):
+        assert "ORIGINAL_HEADER_SENTINEL" in prompt
+        assert "ORIGINAL_CODE_SENTINEL" in prompt
+        assert "VERIFIER_ERROR_SENTINEL" in prompt
+        assert "Make targeted" in prompt
 
 
 def test_generate_code_write_path_has_no_legacy_functions_header_variables():

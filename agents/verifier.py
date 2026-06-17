@@ -17,11 +17,12 @@ import os
 import re
 from pathlib import Path
 
-from agents.codegen_contract import (
+from ir import (
+    IRGraph,
+    IROpType,
     helper_name_from_signature,
     required_helper_signatures,
 )
-from ir import IRGraph, IROpType
 from state import AgentState
 from tools.compile import (
     check_syntax,
