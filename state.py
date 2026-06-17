@@ -23,6 +23,14 @@ class VerificationResult(TypedDict, total=False):
     compiler_output: str
 
 
+class LLMMetrics(TypedDict, total=False):
+    """Accumulated metrics for LLM calls made during code generation."""
+    input_tokens: int
+    output_tokens: int
+    latency_sec: float
+    cost_usd: float
+
+
 class SimulationResult(TypedDict, total=False):
     """Structured result from the Hazard3 simulation agent."""
     success: bool
@@ -98,6 +106,9 @@ class AgentState(TypedDict, total=False):
     code_path: str                           # Path to saved model.c
     header_path: str                         # Path to saved weights.h
     model_header_path: str                   # Path to saved model.h
+
+    # ── LLM Metrics ─────────────────────────────────────────────
+    llm_metrics: LLMMetrics                   # Accumulated LLM token/latency/cost metrics
 
     # ── Verification ────────────────────────────────────────────
     verification_result: VerificationResult

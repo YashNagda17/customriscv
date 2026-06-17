@@ -34,6 +34,66 @@ HOST_COMPILERS = [
     "clang",
 ]
 
+# Extra include search paths for environments where subprocess compiler
+# invocations do not inherit the same standard-header search path users see
+# in an interactive shell. Values are path-list strings separated by os.pathsep.
+INCLUDE_PATH_ENV_VARS = [
+    "EXTRA_C_INCLUDE_DIRS",
+    "C_INCLUDE_PATH",
+    "CPATH",
+    "CPLUS_INCLUDE_PATH",
+]
+
+
+def _split_path_env(value: str) -> list[str]:
+    """Split an include-path environment variable into non-empty entries."""
+    return [part for part in value.split(os.pathsep) if part]
+
+
+def _dedupe_existing_dirs(paths: list[str]) -> list[str]:
+    """Return existing directories while preserving order and removing duplicates."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in paths:
+        normalized = os.path.abspath(os.path.expanduser(path))
+        if normalized in seen or not os.path.isdir(normalized):
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _compiler_include_args(compiler: str) -> list[str]:
+    """Build explicit include args for standard headers visible to Python subprocesses."""
+    args: list[str] = []
+
+    sysroot = os.environ.get("RISCV_SYSROOT", "")
+    if sysroot and _is_riscv_compiler(compiler) and os.path.isdir(sysroot):
+        args.extend(["--sysroot", sysroot])
+
+    include_dirs: list[str] = []
+    for var in INCLUDE_PATH_ENV_VARS:
+        include_dirs.extend(_split_path_env(os.environ.get(var, "")))
+
+    riscv_include_dir = os.environ.get("RISCV_INCLUDE_DIR", "")
+    if riscv_include_dir and _is_riscv_compiler(compiler):
+        include_dirs.append(riscv_include_dir)
+
+    # Host compilers normally know these paths, but explicitly passing existing
+    # standard include dirs makes verification more robust inside Python workers
+    # and minimal containers where environment setup may differ from the shell.
+    if not _is_riscv_compiler(compiler):
+        include_dirs.extend([
+            "/usr/local/include",
+            "/usr/include",
+            "/usr/include/x86_64-linux-gnu",
+        ])
+
+    for include_dir in _dedupe_existing_dirs(include_dirs):
+        args.extend(["-isystem", include_dir])
+    return args
+
+
 # ── RISC-V compilation flags ───────────────────────────────────
 RISCV_CFLAGS = [
     "-march=rv32imac",
@@ -177,6 +237,7 @@ def check_syntax(
 
     if include_dir:
         args.extend(["-I", include_dir])
+    args.extend(_compiler_include_args(compiler))
 
     # Add RISC-V flags only for cross-compiler
     if _is_riscv_compiler(compiler):
@@ -222,6 +283,7 @@ def compile_to_object(
 
     if include_dir:
         args.extend(["-I", include_dir])
+    args.extend(_compiler_include_args(compiler))
 
     args.extend(["-o", output_path, source_path])
 
@@ -284,6 +346,7 @@ def compile_to_elf(
 
     if include_dir:
         args.extend(["-I", include_dir])
+    args.extend(_compiler_include_args(compiler))
 
     if linker_script:
         args.extend(["-T", linker_script])
