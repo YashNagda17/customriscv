@@ -200,6 +200,33 @@ def test_model_header_rejects_implementation_bodies():
 def test_vllm_max_tokens_env_drives_llm_max_tokens():
     assert code_generator.LLM_MAX_TOKENS == code_generator.VLLM_MAX_TOKENS
 
+    assert code_generator._extract_c_artifact("#pragma once", "model.h") == "#pragma once"
+
+    assert (
+        code_generator._extract_c_artifact(
+            'Here is the implementation:\n#include "model.h"\nvoid model_inference(const float* input, float* output) {}',
+            "model.c",
+        )
+        == '#include "model.h"\nvoid model_inference(const float* input, float* output) {}'
+    )
+
+    assert (
+        code_generator._extract_c_artifact(
+            '```c model.h\n#pragma once\n// old echoed header\n```\n```c model.h\n#pragma once\n#include "weights.h"\n```',
+            "model.h",
+        )
+        == '#pragma once\n#include "weights.h"'
+    )
+
+    with pytest.raises(ValueError, match="Could not extract model.h"):
+        code_generator._extract_c_artifact("not C code", "model.h")
+
+
+def test_vllm_max_tokens_env_drives_llm_max_tokens():
+    assert code_generator.LLM_MAX_TOKENS == code_generator.VLLM_MAX_TOKENS
+
+    with pytest.raises(ValueError, match="Could not extract model.h"):
+        code_generator._extract_c_artifact("not C code", "model.h")
 
 def test_generate_code_writes_model_header_and_implementation(monkeypatch, tmp_path):
     monkeypatch.setattr(code_generator, "OUTPUT_DIR", tmp_path)
