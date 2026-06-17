@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -78,6 +79,16 @@ def _read_generated_model_header_from_output(state: AgentState) -> str:
     return _read_generated_artifact_from_output(
         state, "model_header_path", "generated_model_header", "model.h"
     )
+
+
+def _is_repair_mode(state: AgentState) -> bool:
+    """Return True when generation should receive previous artifacts for repair."""
+    if state.get("verification_feedback", ""):
+        return True
+    verification_result = state.get("verification_result", {})
+    if verification_result and not verification_result.get("passed", False):
+        return True
+    return state.get("verification_attempts", 0) > 0
 
 
 def _build_repair_context_sections(state: AgentState, target_artifact: str) -> list[str]:
@@ -164,7 +175,7 @@ def _build_user_prompt(state: AgentState) -> str:
     """
     ir_dict = state.get("ir_graph", {})
     ir_graph = IRGraph.from_dict(ir_dict)
-    is_retry = bool(state.get("verification_feedback", ""))
+    is_retry = _is_repair_mode(state)
 
     sections = []
 
@@ -315,7 +326,7 @@ def _build_model_header_prompt(state: AgentState) -> str:
     """
     ir_graph = IRGraph.from_dict(state.get("ir_graph", {}))
     required_helpers = required_helper_signatures(state.get("ir_graph", {}))
-    is_retry = bool(state.get("verification_feedback", ""))
+    is_retry = _is_repair_mode(state)
     sections = [
         "=" * 60,
         "IR GRAPH",
@@ -457,12 +468,88 @@ def _extract_c_artifact(response, filename):
     )
 
 
+def _write_llm_call_log(
+    *,
+    step_number: int,
+    attempt: int,
+    messages,
+    raw_response: str,
+) -> Path:
+    """Persist the exact LLM input prompt and raw response for debugging."""
+    log_dir = OUTPUT_DIR / "llm_call"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    log_path = log_dir / f"llm_step_{step_number}_{timestamp}_attempt{attempt}.txt"
+
+    lines = [
+        f"LLM step: {step_number}",
+        f"Attempt: {attempt}",
+        f"UTC timestamp: {timestamp}",
+        "",
+        "=" * 80,
+        "INPUT PROMPT",
+        "=" * 80,
+    ]
+    for index, message in enumerate(messages, 1):
+        role = getattr(message, "type", message.__class__.__name__)
+        content = getattr(message, "content", str(message))
+        lines.extend([
+            "",
+            f"--- Message {index}: {role} ---",
+            str(content),
+        ])
+
+    lines.extend([
+        "",
+        "=" * 80,
+        "RAW LLM RESPONSE",
+        "=" * 80,
+        raw_response,
+        "",
+    ])
+    log_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("LLM step %d call log written to: %s", step_number, log_path)
+    return log_path
+
 def _invoke_llm_and_extract_artifact(llm, messages, filename: str, step_name: str) -> str:
     """Invoke the LLM and retry once if artifact extraction fails."""
     last_error: ValueError | None = None
     for attempt in range(1, 3):
         response = llm.invoke(messages)
         raw_response = response.content
+        logger.info(
+            "LLM %s response length: %d chars",
+            filename,
+            len(raw_response),
+        )
+        try:
+            return _extract_c_artifact(raw_response, filename)
+        except ValueError as exc:
+            last_error = exc
+            if attempt == 1:
+                logger.warning(
+                    "%s extraction failed: %s. Retrying generation once.",
+                    step_name,
+                    exc,
+                )
+            else:
+                logger.error("%s extraction failed after retry: %s", step_name, exc)
+    raise last_error or ValueError(f"Could not extract {filename}.")
+
+def _invoke_llm_and_extract_artifact(
+    llm, messages, filename: str, step_name: str, step_number: int
+) -> str:
+    """Invoke the LLM and retry once if artifact extraction fails."""
+    last_error: ValueError | None = None
+    for attempt in range(1, 3):
+        response = llm.invoke(messages)
+        raw_response = response.content
+        _write_llm_call_log(
+            step_number=step_number,
+            attempt=attempt,
+            messages=messages,
+            raw_response=raw_response,
+        )
         logger.info(
             "LLM %s response length: %d chars",
             filename,
@@ -615,7 +702,7 @@ def generate_code(state: AgentState) -> dict:
 
     attempt = state.get("verification_attempts", 0)
     opt_iter = state.get("optimization_iteration", 0)
-    is_retry = bool(state.get("verification_feedback", ""))
+    is_retry = _is_repair_mode(state)
     logger.info(
         f"  Verification attempt: {attempt}, "
         f"Optimization iteration: {opt_iter}, "
@@ -655,7 +742,7 @@ def generate_code(state: AgentState) -> dict:
         logger.info("  → REPAIR MODE: feeding back current code + errors")
     # ── Extract model.h ─────────────────────────────────────────
     model_h = _invoke_llm_and_extract_artifact(
-        llm, header_messages, "model.h", "step 2 model.h"
+        llm, header_messages, "model.h", "step 2 model.h", 2
     )
 
     # Step 3: ask the LLM to implement model.c against the model.h contract.
@@ -667,7 +754,7 @@ def generate_code(state: AgentState) -> dict:
     logger.info(f"Calling LLM ({VLLM_MODEL}) for step 3 model.c ...")
     # ── Extract model.c ─────────────────────────────────────────
     model_c = _invoke_llm_and_extract_artifact(
-        llm, c_messages, "model.c", "step 3 model.c"
+        llm, c_messages, "model.c", "step 3 model.c", 3
     )
 
     # ── Write files ─────────────────────────────────────────────
