@@ -90,10 +90,7 @@ def run_pipeline(model: torch.nn.Module, sample_input: torch.Tensor, config: dic
     # 3. Initialize State
     initial_state = {
         "model_name": config.get("name", "model"),
-        "model": model,
-        "fx_graph": traced_model,
         "fx_graph_str": str(traced_model.graph),
-        "sample_input": sample_input,
         "reference_outputs": reference_outputs,
         "enable_optimization": config.get("optimize", False),
         "weight_precision": config.get("precision", "f32"),
