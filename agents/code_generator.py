@@ -18,9 +18,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -44,7 +44,7 @@ VLLM_MAX_TOKENS = int(os.environ.get("VLLM_MAX_TOKENS", "200000"))
 
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "codegen.txt"
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
-LLM_MAX_TOKENS = 200_000
+LLM_MAX_TOKENS = VLLM_MAX_TOKENS
 
 
 def _read_generated_artifact_from_output(
@@ -60,11 +60,15 @@ def _read_generated_artifact_from_output(
         if path.exists():
             return path.read_text(encoding="utf-8")
 
+    state_content = state.get(state_key, "")
+    if state_content:
+        return state_content
+
     default_path = OUTPUT_DIR / default_filename
     if default_path.exists():
         return default_path.read_text(encoding="utf-8")
 
-    return state.get(state_key, "")
+    return ""
 
 
 def _read_generated_code_from_output(state: AgentState) -> str:
@@ -102,9 +106,11 @@ def _build_repair_context_sections(state: AgentState, target_artifact: str) -> l
         "=" * 60,
         f"⚠️  REPAIR MODE CONTEXT FOR {target_artifact}",
         "=" * 60,
-        "Use the original generated artifacts below as the starting point. "
+        "Use the original generated artifacts below as context only. "
         "Make targeted fixes only; do not drop unrelated declarations, helper "
-        "functions, buffers, or model_inference steps.",
+        "functions, buffers, or model_inference steps. Output exactly one full "
+        f"replacement {target_artifact} artifact; do not append to prior code "
+        "and do not output the other file type.",
     ]
 
     if current_header:
@@ -411,9 +417,23 @@ def _extract_raw_c_artifact_text(text: str, filename: str) -> str | None:
         return None
 
     artifact = stripped[start:].strip()
-    if filename.endswith(".c") and "void model_inference" not in artifact:
+    if not _artifact_matches_filename(artifact, filename):
         return None
     return artifact
+
+
+def _artifact_matches_filename(artifact: str, filename: str) -> bool:
+    """Return True when extracted C text appears to be the requested file type."""
+    if filename.endswith(".h"):
+        has_guard = "#pragma once" in artifact or "#ifndef" in artifact
+        return (
+            has_guard
+            or '#include "weights.h"' in artifact
+            or "model_inference" in artifact
+        )
+    if filename.endswith(".c"):
+        return '#include "model.h"' in artifact or "void model_inference" in artifact
+    return True
 
 
 def _looks_like_c_artifact(text: str, filename: str) -> bool:
@@ -450,13 +470,19 @@ def _extract_c_artifact(response, filename):
         re.DOTALL,
     )
     if generic_blocks:
-        logger.warning(
-            "No fenced code block named %s found. Using final generic C block.",
-            filename,
-        )
-        # Prefer the final generic block for the same reason: it is usually the
-        # replacement after any echoed context. Never concatenate blocks.
-        return generic_blocks[-1].strip()
+        matching_blocks = [
+            block.strip()
+            for block in generic_blocks
+            if _artifact_matches_filename(block.strip(), filename)
+        ]
+        if matching_blocks:
+            logger.warning(
+                "No fenced code block named %s found. Using final matching generic C block.",
+                filename,
+            )
+            # Prefer the final matching generic block for the same reason: it is
+            # usually the replacement after any echoed context. Never concatenate blocks.
+            return matching_blocks[-1]
 
     raw_artifact = _extract_raw_c_artifact_text(response, filename)
     if raw_artifact is not None:
@@ -470,6 +496,27 @@ def _extract_c_artifact(response, filename):
         f"Could not extract {filename}: expected a fenced code block named "
         f"{filename}, a generic C code block, or raw C artifact text."
     )
+
+
+def _initial_llm_metrics(state: AgentState) -> dict:
+    """Return accumulated LLM metrics with default fields populated."""
+    metrics = state.get("llm_metrics", {}).copy()
+    metrics.setdefault("input_tokens", 0)
+    metrics.setdefault("output_tokens", 0)
+    metrics.setdefault("latency_sec", 0.0)
+    metrics.setdefault("cost_usd", 0.0)
+    return metrics
+
+
+def _record_llm_metrics(llm_metrics: dict, responses: list, latency_sec: float) -> None:
+    """Accumulate latency, approximate cost, and token usage from LLM responses."""
+    llm_metrics["latency_sec"] += latency_sec
+    llm_metrics["cost_usd"] += (latency_sec / 3600.0) * 1.95
+    for response in responses:
+        metadata = getattr(response, "response_metadata", {}) or {}
+        usage = metadata.get("token_usage", {}) or {}
+        llm_metrics["input_tokens"] += usage.get("prompt_tokens", 0)
+        llm_metrics["output_tokens"] += usage.get("completion_tokens", 0)
 
 
 def _write_llm_call_log(
@@ -518,11 +565,16 @@ def _write_llm_call_log(
 
 def _invoke_llm_and_extract_artifact(
     llm, messages, filename: str, step_name: str, step_number: int
-) -> str:
+) -> tuple[str, list, float]:
     """Invoke the LLM and retry once if artifact extraction fails."""
     last_error: ValueError | None = None
+    responses: list = []
+    total_latency = 0.0
     for attempt in range(1, 3):
+        start_time = time.time()
         response = llm.invoke(messages)
+        total_latency += time.time() - start_time
+        responses.append(response)
         raw_response = response.content
         _write_llm_call_log(
             step_number=step_number,
@@ -536,7 +588,7 @@ def _invoke_llm_and_extract_artifact(
             len(raw_response),
         )
         try:
-            return _extract_c_artifact(raw_response, filename)
+            return _extract_c_artifact(raw_response, filename), responses, total_latency
         except ValueError as exc:
             last_error = exc
             if attempt == 1:
@@ -717,6 +769,7 @@ def generate_code(state: AgentState) -> dict:
         temperature=0.2 if not is_retry else 0.0,  # Lower temp on retries
         max_tokens=LLM_MAX_TOKENS,
     )
+    llm_metrics = _initial_llm_metrics(state)
 
     # Step 2: ask the LLM for model.h, which defines includes, tensor
     # contracts, dependencies, and all function stubs to be implemented.
@@ -729,8 +782,17 @@ def generate_code(state: AgentState) -> dict:
     if is_retry:
         logger.info("  → REPAIR MODE: feeding back current code + errors")
     # ── Extract model.h ─────────────────────────────────────────
-    model_h = _invoke_llm_and_extract_artifact(
+    model_h, header_responses, header_latency = _invoke_llm_and_extract_artifact(
         llm, header_messages, "model.h", "step 2 model.h", 2
+    )
+
+    # Persist the step-2 contract immediately so the exact header passed to
+    # step 3 is available on disk even if step 3 fails or is interrupted.
+    intermediate_model_header_path = OUTPUT_DIR / "model.h"
+    _replace_text_file(intermediate_model_header_path, model_h)
+    logger.info(
+        "Intermediate model header written before step 3: %s",
+        intermediate_model_header_path,
     )
 
     # Step 3: ask the LLM to implement model.c against the model.h contract.
@@ -741,8 +803,14 @@ def generate_code(state: AgentState) -> dict:
 
     logger.info(f"Calling LLM ({VLLM_MODEL}) for step 3 model.c ...")
     # ── Extract model.c ─────────────────────────────────────────
-    model_c = _invoke_llm_and_extract_artifact(
+    model_c, c_responses, c_latency = _invoke_llm_and_extract_artifact(
         llm, c_messages, "model.c", "step 3 model.c", 3
+    )
+
+    _record_llm_metrics(
+        llm_metrics,
+        [*header_responses, *c_responses],
+        header_latency + c_latency,
     )
 
     # ── Write files ─────────────────────────────────────────────
@@ -757,5 +825,6 @@ def generate_code(state: AgentState) -> dict:
         "generated_code": model_c,
         "generated_header": weights_h,
         "generated_model_header": model_h,
+        "llm_metrics": llm_metrics,
         **artifact_paths,
     }

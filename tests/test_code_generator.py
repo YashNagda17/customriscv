@@ -15,6 +15,9 @@ from agents.verifier import _check_model_header, _check_required_helper_definiti
 class _FakeResponse:
     def __init__(self, content: str):
         self.content = content
+        self.response_metadata = {
+            "token_usage": {"prompt_tokens": 11, "completion_tokens": 7}
+        }
 
 
 class _FakeChatOpenAI:
@@ -58,6 +61,16 @@ class _FakeChatOpenAIWithStep3Drift(_FakeChatOpenAI):
                 '    output[0] = input[0];\n'
                 '}\n'
             )
+        return super().invoke(messages)
+
+
+class _FakeChatOpenAIAssertsHeaderPersisted(_FakeChatOpenAI):
+    def invoke(self, messages):
+        prompt = messages[-1].content
+        if "STEP 3 TASK: IMPLEMENT model.c" in prompt:
+            header_path = code_generator.OUTPUT_DIR / "model.h"
+            assert header_path.exists()
+            assert '#include "weights.h"' in header_path.read_text(encoding="utf-8")
         return super().invoke(messages)
 
 
@@ -138,6 +151,15 @@ def test_extract_c_artifact_prefers_named_block_and_recovers_common_llm_drift():
         == "#pragma once"
     )
 
+    assert (
+        code_generator._extract_c_artifact(
+            '```c\n#include "model.h"\nvoid model_inference(const float* input, float* output) {}\n```\n'
+            '```c\n#pragma once\n#include "weights.h"\nvoid model_inference(const float* input, float* output);\n```',
+            "model.h",
+        )
+        == '#pragma once\n#include "weights.h"\nvoid model_inference(const float* input, float* output);'
+    )
+
     assert code_generator._extract_c_artifact("#pragma once", "model.h") == "#pragma once"
 
     assert (
@@ -155,6 +177,13 @@ def test_extract_c_artifact_prefers_named_block_and_recovers_common_llm_drift():
         )
         == '#pragma once\n#include "weights.h"'
     )
+
+    with pytest.raises(ValueError, match="Could not extract model.h"):
+        code_generator._extract_c_artifact("not C code", "model.h")
+
+
+def test_vllm_max_tokens_env_drives_llm_max_tokens():
+    assert code_generator.LLM_MAX_TOKENS == code_generator.VLLM_MAX_TOKENS
 
     with pytest.raises(ValueError, match="Could not extract model.h"):
         code_generator._extract_c_artifact("not C code", "model.h")
@@ -183,6 +212,120 @@ def test_generate_code_writes_model_header_and_implementation(monkeypatch, tmp_p
     assert "OLD_CODE_SHOULD_BE_REPLACED" not in model_c_text
     assert result["generated_model_header"] == model_h_path.read_text(encoding="utf-8")
     assert result["generated_code"] == model_c_path.read_text(encoding="utf-8")
+    assert result["llm_metrics"]["input_tokens"] == 22
+    assert result["llm_metrics"]["output_tokens"] == 14
+    assert result["llm_metrics"]["latency_sec"] >= 0.0
+    assert result["llm_metrics"]["cost_usd"] >= 0.0
+
+    llm_logs = sorted((tmp_path / "llm_call").glob("llm_step_*.txt"))
+    assert len(llm_logs) == 2
+    assert any("llm_step_2_" in path.name for path in llm_logs)
+    assert any("llm_step_3_" in path.name for path in llm_logs)
+    combined_logs = "\n".join(path.read_text(encoding="utf-8") for path in llm_logs)
+    assert "INPUT PROMPT" in combined_logs
+    assert "RAW LLM RESPONSE" in combined_logs
+    assert "STEP 2 TASK: CREATE model.h" in combined_logs
+    assert "STEP 3 TASK: IMPLEMENT model.c" in combined_logs
+
+
+def test_generate_code_persists_step2_header_before_step3(monkeypatch, tmp_path):
+    monkeypatch.setattr(code_generator, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(code_generator, "ChatOpenAI", _FakeChatOpenAIAssertsHeaderPersisted)
+
+    result = code_generator.generate_code(_minimal_state())
+
+    assert Path(result["model_header_path"]).read_text(encoding="utf-8").startswith(
+        "#pragma once"
+    )
+
+
+def test_generate_code_recovers_unfenced_step3_model_c(monkeypatch, tmp_path):
+    monkeypatch.setattr(code_generator, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(code_generator, "ChatOpenAI", _FakeChatOpenAIWithStep3Drift)
+
+    result = code_generator.generate_code(_minimal_state())
+
+    assert result["generated_code"].startswith('#include "model.h"')
+    assert "Here is the implementation" not in result["generated_code"]
+    assert "void model_inference" in result["generated_code"]
+
+
+def test_repair_prompts_include_original_artifacts_and_errors(tmp_path):
+    model_h_path = tmp_path / "model.h"
+    model_c_path = tmp_path / "model.c"
+    model_h_path.write_text(
+        '#pragma once\n#include "weights.h"\n// ORIGINAL_HEADER_SENTINEL\n',
+        encoding="utf-8",
+    )
+    model_c_path.write_text(
+        '#include "model.h"\n// ORIGINAL_CODE_SENTINEL\n'
+        'void model_inference(const float* input, float* output) { output[0] = input[0]; }\n',
+        encoding="utf-8",
+    )
+    state = {
+        **_minimal_state(),
+        "verification_feedback": "VERIFIER_ERROR_SENTINEL",
+        "model_header_path": str(model_h_path),
+        "code_path": str(model_c_path),
+    }
+
+    header_prompt = code_generator._build_model_header_prompt(state)
+    c_prompt = code_generator._build_model_c_prompt(state, "#pragma once\n")
+
+    for prompt in (header_prompt, c_prompt):
+        assert "ORIGINAL_HEADER_SENTINEL" in prompt
+        assert "ORIGINAL_CODE_SENTINEL" in prompt
+        assert "VERIFIER_ERROR_SENTINEL" in prompt
+        assert "Make targeted" in prompt
+
+
+def test_repair_prompt_prefers_state_artifacts_over_stale_default_output(monkeypatch, tmp_path):
+    monkeypatch.setattr(code_generator, "OUTPUT_DIR", tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "model.h").write_text("// STALE_OUTPUT_HEADER", encoding="utf-8")
+    (tmp_path / "model.c").write_text("// STALE_OUTPUT_CODE", encoding="utf-8")
+    state = {
+        **_minimal_state(),
+        "verification_feedback": "STATE_ERROR_SENTINEL",
+        "generated_model_header": "#pragma once\n// STATE_HEADER_SENTINEL\n",
+        "generated_code": '#include "model.h"\n// STATE_CODE_SENTINEL\n',
+    }
+
+    prompt = code_generator._build_model_c_prompt(state, "#pragma once\n")
+
+    assert "STATE_HEADER_SENTINEL" in prompt
+    assert "STATE_CODE_SENTINEL" in prompt
+    assert "STALE_OUTPUT_HEADER" not in prompt
+    assert "STALE_OUTPUT_CODE" not in prompt
+
+
+def test_repair_mode_uses_previous_artifacts_even_without_feedback_text(tmp_path):
+    model_h_path = tmp_path / "model.h"
+    model_c_path = tmp_path / "model.c"
+    model_h_path.write_text(
+        "#pragma once\n// HEADER_WITHOUT_FEEDBACK_SENTINEL\n",
+        encoding="utf-8",
+    )
+    model_c_path.write_text(
+        '#include "model.h"\n// CODE_WITHOUT_FEEDBACK_SENTINEL\n'
+        'void model_inference(const float* input, float* output) { output[0] = input[0]; }\n',
+        encoding="utf-8",
+    )
+    state = {
+        **_minimal_state(),
+        "verification_attempts": 1,
+        "verification_feedback": "",
+        "verification_result": {"passed": False, "errors": ["compile failed"]},
+        "model_header_path": str(model_h_path),
+        "code_path": str(model_c_path),
+    }
+
+    assert code_generator._is_repair_mode(state)
+    prompt = code_generator._build_model_c_prompt(state, "#pragma once\n")
+
+    assert "HEADER_WITHOUT_FEEDBACK_SENTINEL" in prompt
+    assert "CODE_WITHOUT_FEEDBACK_SENTINEL" in prompt
+    assert "VERIFICATION ERRORS" in prompt
 
     llm_logs = sorted((tmp_path / "llm_call").glob("llm_step_*.txt"))
     assert len(llm_logs) == 2
