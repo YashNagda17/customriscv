@@ -588,10 +588,17 @@ def generate_code(state: AgentState) -> dict:
         HumanMessage(content=_build_model_header_prompt(state)),
     ]
 
+    import time
+    llm_metrics = state.get("llm_metrics", {"input_tokens": 0, "output_tokens": 0, "latency_sec": 0.0, "cost_usd": 0.0}).copy()
+
     logger.info(f"Calling LLM ({VLLM_MODEL}) for step 2 model.h ...")
     if is_retry:
         logger.info("  → REPAIR MODE: feeding back current code + errors")
+    
+    t0 = time.time()
     header_response = llm.invoke(header_messages)
+    t1 = time.time()
+    
     raw_header_response = header_response.content
     logger.info(f"LLM model.h response length: {len(raw_header_response)} chars")
 
@@ -605,12 +612,26 @@ def generate_code(state: AgentState) -> dict:
     ]
 
     logger.info(f"Calling LLM ({VLLM_MODEL}) for step 3 model.c ...")
+    
+    t2 = time.time()
     c_response = llm.invoke(c_messages)
+    t3 = time.time()
+    
     raw_c_response = c_response.content
     logger.info(f"LLM model.c response length: {len(raw_c_response)} chars")
 
     # ── Extract model.c ─────────────────────────────────────────
     model_c = _extract_c_artifact(raw_c_response, "model.c")
+
+    # ── Update Metrics ──────────────────────────────────────────
+    latency = (t1 - t0) + (t3 - t2)
+    llm_metrics["latency_sec"] += latency
+    llm_metrics["cost_usd"] += (latency / 3600.0) * 1.95  # MI300X cost
+
+    for resp in [header_response, c_response]:
+        usage = resp.response_metadata.get("token_usage", {})
+        llm_metrics["input_tokens"] += usage.get("prompt_tokens", 0)
+        llm_metrics["output_tokens"] += usage.get("completion_tokens", 0)
 
     # ── Write files ─────────────────────────────────────────────
     artifact_paths = _write_generated_artifacts(
@@ -624,5 +645,6 @@ def generate_code(state: AgentState) -> dict:
         "generated_code": model_c,
         "generated_header": weights_h,
         "generated_model_header": model_h,
+        "llm_metrics": llm_metrics,
         **artifact_paths,
     }

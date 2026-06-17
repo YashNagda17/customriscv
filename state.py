@@ -100,6 +100,7 @@ class AgentState(TypedDict, total=False):
 
     # ── Final Report ────────────────────────────────────────────
     final_report: str                        # Markdown report
+    llm_metrics: dict                        # Tracks {'input_tokens': int, 'output_tokens': int, 'latency_sec': float, 'cost_usd': float}
 
     # ── Error Handling ──────────────────────────────────────────
     error: Optional[str]                     # Fatal error message

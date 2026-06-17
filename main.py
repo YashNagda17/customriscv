@@ -103,8 +103,16 @@ def run_pipeline(model: torch.nn.Module, sample_input: torch.Tensor, config: dic
         "human_approved": False,
         "human_feedback": "",
     }
-    
     start_from = config.get("start_from", "parse_fx")
+
+    if start_from == "parse_fx":
+        # We cannot put live PyTorch objects into LangGraph state because MemorySaver
+        # saves an initial checkpoint immediately and fails to serialize them via msgpack.
+        # Instead, we pass them directly to the fx_parser module via its global context.
+        import agents.fx_parser
+        agents.fx_parser.GLOBAL_PYTORCH_OBJECTS["model"] = model
+        agents.fx_parser.GLOBAL_PYTORCH_OBJECTS["fx_graph"] = traced_model
+        agents.fx_parser.GLOBAL_PYTORCH_OBJECTS["sample_input"] = sample_input
     
     if start_from != "parse_fx":
         import json

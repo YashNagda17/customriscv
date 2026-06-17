@@ -189,8 +189,15 @@ def optimize(state: AgentState) -> dict:
         HumanMessage(content=user_prompt),
     ]
 
+    import time
+    llm_metrics = state.get("llm_metrics", {"input_tokens": 0, "output_tokens": 0, "latency_sec": 0.0, "cost_usd": 0.0}).copy()
+
     logger.info(f"Calling LLM for optimization suggestions...")
+    
+    t0 = time.time()
     response = llm.invoke(messages)
+    t1 = time.time()
+    
     raw_response = response.content
 
     # ── Parse suggestions ───────────────────────────────────────
@@ -200,10 +207,20 @@ def optimize(state: AgentState) -> dict:
     for i, s in enumerate(suggestions, 1):
         logger.info(f"  {i}. {s}")
 
+    # ── Update Metrics ──────────────────────────────────────────
+    latency = t1 - t0
+    llm_metrics["latency_sec"] += latency
+    llm_metrics["cost_usd"] += (latency / 3600.0) * 1.95  # MI300X cost
+    
+    usage = response.response_metadata.get("token_usage", {})
+    llm_metrics["input_tokens"] += usage.get("prompt_tokens", 0)
+    llm_metrics["output_tokens"] += usage.get("completion_tokens", 0)
+
     return {
         "optimization_suggestions": suggestions,
         "optimization_iteration": iteration,
         # Reset verification counter for re-verification after optimization
         "verification_attempts": 0,
         "verification_feedback": "",
+        "llm_metrics": llm_metrics,
     }

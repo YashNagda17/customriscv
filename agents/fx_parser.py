@@ -22,6 +22,10 @@ from tools.export_weights import export_weights_binary
 
 logger = logging.getLogger(__name__)
 
+# Module-level context for passing PyTorch objects that cannot be serialized
+# by LangGraph's checkpointer. main.py will populate this before running the graph.
+GLOBAL_PYTORCH_OBJECTS: dict[str, Any] = {}
+
 # ── Mapping from torch.nn module types to IR ops ────────────────
 MODULE_TYPE_MAP: dict[type, str] = {
     nn.Conv2d: IROpType.CONV2D,
@@ -207,9 +211,13 @@ def parse_fx_graph(state: AgentState) -> dict:
     Writes: state["ir_graph"], state["ir_summary"], state["weights_metadata"],
             state["weights_path"], state["total_params"], state["model_memory_bytes"]
     """
-    fx_module = state["fx_graph"]
-    model = state["model"]
+    fx_module = GLOBAL_PYTORCH_OBJECTS.get("fx_graph")
+    model = GLOBAL_PYTORCH_OBJECTS.get("model")
     model_name = state.get("model_name", "unnamed_model")
+
+    if fx_module is None or model is None:
+        logger.error("PyTorch objects not found in GLOBAL_PYTORCH_OBJECTS. Did main.py populate them?")
+        return {}
 
     logger.info(f"Parsing FX graph for model: {model_name}")
 
@@ -244,7 +252,7 @@ def parse_fx_graph(state: AgentState) -> dict:
                     break
 
         # Attempt shape propagation with a sample input
-        sample_input = state.get("sample_input", None)
+        sample_input = GLOBAL_PYTORCH_OBJECTS.get("sample_input", None)
         if sample_input is not None:
             ShapeProp(fx_module).propagate(sample_input)
     except Exception as e:
