@@ -113,6 +113,8 @@ def _check_model_header(model_header: str, ir_dict: dict | None = None) -> list[
 
     if "#pragma once" not in model_header and "#ifndef" not in model_header:
         issues.append("WARNING: model.h has no include guard.")
+    if '#include "model.h"' in model_header:
+        issues.append('ERROR: model.h must not include "model.h"; model.c includes model.h.')
     if '#include "weights.h"' not in model_header:
         issues.append('ERROR: model.h must include "weights.h".')
     if "model_inference" not in model_header:
@@ -122,6 +124,10 @@ def _check_model_header(model_header: str, ir_dict: dict | None = None) -> list[
     if re.search(r"\bstatic\s+float\s+\w+\s*\[", model_header):
         issues.append(
             "ERROR: model.h must not define activation storage arrays; define storage in model.c."
+        )
+    if re.search(r"\)\s*\{", model_header):
+        issues.append(
+            "ERROR: model.h must contain declarations only; function implementations belong in model.c."
         )
     if ir_dict is not None:
         for signature in required_helper_signatures(ir_dict):

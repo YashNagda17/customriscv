@@ -422,14 +422,21 @@ def _extract_raw_c_artifact_text(text: str, filename: str) -> str | None:
     return artifact
 
 
+def _has_function_body(artifact: str) -> bool:
+    """Return True if C text appears to contain function implementations."""
+    return bool(re.search(r"\)\s*\{", artifact))
+
+
 def _artifact_matches_filename(artifact: str, filename: str) -> bool:
     """Return True when extracted C text appears to be the requested file type."""
     if filename.endswith(".h"):
         has_guard = "#pragma once" in artifact or "#ifndef" in artifact
         return (
             has_guard
-            or '#include "weights.h"' in artifact
-            or "model_inference" in artifact
+            and '#include "weights.h"' in artifact
+            and '#include "model.h"' not in artifact
+            and "static float" not in artifact
+            and not _has_function_body(artifact)
         )
     if filename.endswith(".c"):
         return '#include "model.h"' in artifact or "void model_inference" in artifact
@@ -454,15 +461,26 @@ def _extract_c_artifact(response, filename):
     named_pattern = rf"```(?:c|C)?\s*{re.escape(filename)}\s*\n(.*?)```"
     named_blocks = re.findall(named_pattern, response, re.DOTALL)
     if named_blocks:
-        if len(named_blocks) > 1:
-            logger.warning(
-                "Multiple %s code blocks detected (%d). Using final block.",
-                filename,
-                len(named_blocks),
-            )
-        # If the model echoes an old artifact before the corrected replacement,
-        # the final block is the intended replacement. Never concatenate blocks.
-        return named_blocks[-1].strip()
+        matching_named_blocks = [
+            block.strip()
+            for block in named_blocks
+            if _artifact_matches_filename(block.strip(), filename)
+        ]
+        if matching_named_blocks:
+            if len(named_blocks) > 1:
+                logger.warning(
+                    "Multiple %s code blocks detected (%d). Using final matching block.",
+                    filename,
+                    len(named_blocks),
+                )
+            # If the model echoes an old artifact before the corrected replacement,
+            # the final matching block is the intended replacement. Never concatenate blocks.
+            return matching_named_blocks[-1]
+        logger.warning(
+            "Found %d named %s code block(s), but none matched the requested file type.",
+            len(named_blocks),
+            filename,
+        )
 
     generic_blocks = re.findall(
         r"```(?:c|C)?\s*\n(.*?)```",
