@@ -511,6 +511,30 @@ def _write_llm_call_log(
     logger.info("LLM step %d call log written to: %s", step_number, log_path)
     return log_path
 
+def _invoke_llm_and_extract_artifact(llm, messages, filename: str, step_name: str) -> str:
+    """Invoke the LLM and retry once if artifact extraction fails."""
+    last_error: ValueError | None = None
+    for attempt in range(1, 3):
+        response = llm.invoke(messages)
+        raw_response = response.content
+        logger.info(
+            "LLM %s response length: %d chars",
+            filename,
+            len(raw_response),
+        )
+        try:
+            return _extract_c_artifact(raw_response, filename)
+        except ValueError as exc:
+            last_error = exc
+            if attempt == 1:
+                logger.warning(
+                    "%s extraction failed: %s. Retrying generation once.",
+                    step_name,
+                    exc,
+                )
+            else:
+                logger.error("%s extraction failed after retry: %s", step_name, exc)
+    raise last_error or ValueError(f"Could not extract {filename}.")
 
 def _invoke_llm_and_extract_artifact(
     llm, messages, filename: str, step_name: str, step_number: int
